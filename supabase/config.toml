@@ -1,0 +1,38 @@
+project_id = "majqoqagohicjigmsilu"
+
+[functions.create-enhanced-student]
+verify_jwt = true
+
+[functions.daily-recovery-check]
+verify_jwt = false
+
+[functions.update-recovery-status]
+verify_jwt = false
+
+[functions.installment-reminder-scheduler]
+verify_jwt = false
+
+[functions.meta-ads-metrics]
+verify_jwt = false
+
+[functions.shopify-metrics]
+verify_jwt = false
+
+[functions.process-success-partner-message]
+verify_jwt = true
+
+[functions.build-leaderboard]
+verify_jwt = false
+
+[functions.admin-reset-sp-credits]
+verify_jwt = true
+
+[functions.success-partner-credits]
+verify_jwt = true
+
+[functions.check-access-expiry]
+verify_jwt = false
+
+[functions.live-session-reminders]
+verify_jwt = false
+schedule = "*/15 * * * *"

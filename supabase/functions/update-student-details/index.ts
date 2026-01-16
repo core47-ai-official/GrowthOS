@@ -1,0 +1,436 @@
+import { serve } from 'https://deno.land/std@0.190.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.3';
+import { SMTPClient } from '../_shared/smtp-client.ts';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+function generateSecurePassword(): string {
+  const length = 12;
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*';
+  let password = '';
+  for (let i = 0; i < length; i++) {
+    password += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return password;
+}
+
+interface UpdateStudentRequest {
+  user_id: string;
+  full_name: string;
+  email: string;
+  phone?: string;
+  resend_credentials?: boolean;
+  // Access control settings
+  enrollment_id?: string;
+  batch_id?: string | null;
+  drip_override?: boolean;
+  drip_enabled?: boolean | null;
+  sequential_override?: boolean;
+  sequential_enabled?: boolean | null;
+  // Discount settings
+  discount_type?: 'none' | 'fixed' | 'percentage';
+  discount_amount?: number;
+  discount_percentage?: number;
+}
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const supabaseAdmin = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
+      {
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false,
+        },
+      }
+    );
+
+    const authHeader = req.headers.get('Authorization');
+    if (!authHeader) {
+      throw new Error('Missing authorization header');
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    const { data: { user }, error: userError } = await supabaseAdmin.auth.getUser(token);
+
+    if (userError || !user) {
+      throw new Error('Unauthorized');
+    }
+
+    // Check if user has permission (superadmin or admin)
+    const { data: currentUser, error: roleError } = await supabaseAdmin
+      .from('users')
+      .select('role')
+      .eq('id', user.id)
+      .single();
+
+    if (roleError || !currentUser) {
+      throw new Error('Failed to verify user permissions');
+    }
+
+    if (!['superadmin', 'admin'].includes(currentUser.role)) {
+      throw new Error('Insufficient permissions');
+    }
+
+    const { 
+      user_id, 
+      full_name, 
+      email, 
+      phone, 
+      resend_credentials,
+      enrollment_id,
+      batch_id,
+      drip_override,
+      drip_enabled,
+      sequential_override,
+      sequential_enabled,
+      discount_type,
+      discount_amount,
+      discount_percentage
+    }: UpdateStudentRequest = await req.json();
+
+    if (!user_id || !full_name || !email) {
+      throw new Error('Missing required fields');
+    }
+
+    // Get current student details
+    const { data: existingUser, error: fetchError } = await supabaseAdmin
+      .from('users')
+      .select('email, password_display')
+      .eq('id', user_id)
+      .single();
+
+    if (fetchError || !existingUser) {
+      throw new Error('Student not found');
+    }
+
+    const oldEmail = existingUser.email;
+    const emailChanged = email !== oldEmail;
+
+    // Update user in auth.users with email confirmation disabled
+    console.log('Updating email in auth.users...');
+    const { error: authUpdateError } = await supabaseAdmin.auth.admin.updateUserById(
+      user_id,
+      { 
+        email: email,
+        email_confirm: false  // Critical: bypass email confirmation
+      }
+    );
+
+    if (authUpdateError) {
+      console.error('Failed to update auth.users email:', authUpdateError);
+      throw new Error(`Failed to update auth user: ${authUpdateError.message}`);
+    }
+    console.log('✅ Successfully updated email in auth.users');
+
+    // Update user in public.users
+    const { error: updateError } = await supabaseAdmin
+      .from('users')
+      .update({
+        full_name,
+        email,
+        phone: phone || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', user_id);
+
+    if (updateError) {
+      throw new Error(`Failed to update user: ${updateError.message}`);
+    }
+
+    // Update enrollment access settings and discount if provided
+    if (enrollment_id) {
+      const enrollmentUpdate: Record<string, any> = {
+        updated_at: new Date().toISOString()
+      };
+
+      // Batch assignment
+      if (batch_id !== undefined) {
+        enrollmentUpdate.batch_id = batch_id;
+      }
+
+      // Access settings
+      if (drip_override !== undefined) {
+        enrollmentUpdate.drip_override = drip_override;
+        enrollmentUpdate.drip_enabled = drip_override ? drip_enabled : null;
+      }
+      
+      if (sequential_override !== undefined) {
+        enrollmentUpdate.sequential_override = sequential_override;
+        enrollmentUpdate.sequential_enabled = sequential_override ? sequential_enabled : null;
+      }
+
+      // Discount settings
+      if (discount_type !== undefined) {
+        if (discount_type === 'none') {
+          enrollmentUpdate.discount_amount = null;
+          enrollmentUpdate.discount_percentage = null;
+        } else if (discount_type === 'fixed') {
+          enrollmentUpdate.discount_amount = discount_amount || 0;
+          enrollmentUpdate.discount_percentage = null;
+        } else if (discount_type === 'percentage') {
+          enrollmentUpdate.discount_amount = null;
+          enrollmentUpdate.discount_percentage = discount_percentage || 0;
+        }
+      }
+
+      console.log('Updating enrollment:', { enrollment_id, ...enrollmentUpdate });
+      
+      const { error: enrollmentError } = await supabaseAdmin
+        .from('course_enrollments')
+        .update(enrollmentUpdate)
+        .eq('id', enrollment_id);
+
+      if (enrollmentError) {
+        console.error('Failed to update enrollment:', enrollmentError);
+        // Don't throw - this is non-critical
+      } else {
+        console.log('✅ Successfully updated enrollment settings');
+      }
+    }
+
+    // If email changed and credentials should be resent
+    let emailSent = false;
+    let emailError = null;
+    let passwordRegenerated = false;
+    
+    // Pre-flight checks logging
+    console.log('Email sending conditions check:', {
+      emailChanged,
+      resend_credentials,
+      has_password_display: !!existingUser.password_display,
+      old_email: oldEmail,
+      new_email: email
+    });
+
+    // Verify SMTP configuration
+    const smtpConfigured = !!(
+      Deno.env.get('SMTP_HOST') &&
+      Deno.env.get('SMTP_PORT') &&
+      Deno.env.get('SMTP_USER') &&
+      Deno.env.get('SMTP_PASSWORD') &&
+      Deno.env.get('SMTP_FROM_EMAIL')
+    );
+
+    console.log('SMTP Configuration Status:', {
+      configured: smtpConfigured,
+      has_host: !!Deno.env.get('SMTP_HOST'),
+      has_port: !!Deno.env.get('SMTP_PORT'),
+      has_user: !!Deno.env.get('SMTP_USER'),
+      has_password: !!Deno.env.get('SMTP_PASSWORD'),
+      has_from_email: !!Deno.env.get('SMTP_FROM_EMAIL'),
+      has_from_name: !!Deno.env.get('SMTP_FROM_NAME')
+    });
+
+    if (!smtpConfigured) {
+      emailError = 'SMTP not configured in function secrets. Please configure SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and SMTP_FROM_EMAIL.';
+      console.error('SMTP Configuration Error:', emailError);
+    }
+    
+    // Check if password needs to be generated
+    let passwordToSend = existingUser.password_display;
+
+    if (emailChanged && resend_credentials && !passwordToSend && smtpConfigured) {
+      console.log('No password_display found, generating new password for user:', user_id);
+      
+      try {
+        // Generate new password
+        const newPassword = generateSecurePassword();
+        
+        // Update password in auth.users
+        const { error: pwUpdateError } = await supabaseAdmin.auth.admin.updateUserById(
+          user_id,
+          { 
+            password: newPassword,
+            email_confirm: false
+          }
+        );
+        
+        if (pwUpdateError) {
+          console.error('Failed to update password in auth.users:', pwUpdateError);
+          emailError = `Failed to generate new password: ${pwUpdateError.message}`;
+        } else {
+          // Update password_display in public.users
+          const { error: dbUpdateError } = await supabaseAdmin
+            .from('users')
+            .update({
+              password_display: newPassword,
+              is_temp_password: true,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', user_id);
+          
+          if (dbUpdateError) {
+            console.error('Failed to update password_display:', dbUpdateError);
+            emailError = `Failed to store new password: ${dbUpdateError.message}`;
+          } else {
+            passwordToSend = newPassword;
+            passwordRegenerated = true;
+            console.log('✅ New password generated and stored successfully');
+          }
+        }
+      } catch (error) {
+        console.error('Error during password generation:', error);
+        emailError = `Password generation failed: ${error.message}`;
+      }
+    }
+    
+    if (emailChanged && resend_credentials && passwordToSend && smtpConfigured) {
+      console.log('Starting email sending process...');
+      
+      try {
+        // Get company details
+        console.log('Fetching company settings...');
+        const { data: companySettings, error: companyError } = await supabaseAdmin
+          .from('company_settings')
+          .select('company_name, company_logo, lms_url')
+          .single();
+
+        if (companyError) {
+          console.error('Error fetching company settings:', companyError);
+        }
+
+        const companyName = companySettings?.company_name || 'Growth OS';
+        const loginUrl = companySettings?.lms_url || Deno.env.get('SUPABASE_URL') || '';
+
+        console.log('Company settings retrieved:', { companyName, loginUrl });
+
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          throw new Error(`Invalid email format: ${email}`);
+        }
+
+        // Read CC email from function secrets
+        const ccEmail = Deno.env.get('NOTIFICATION_EMAIL_CC');
+        console.log('CC configuration:', { 
+          has_cc: !!ccEmail, 
+          cc_email: ccEmail ? '***@***.***' : 'none' 
+        });
+
+        console.log('Initializing SMTP client...');
+        const smtpClient = SMTPClient.fromEnv();
+        
+        console.log('Sending email to:', email);
+        await smtpClient.sendEmail({
+          to: email,
+          cc: ccEmail || undefined,
+          subject: `${companyName} - Updated Login Credentials`,
+          html: `
+            <!DOCTYPE html>
+            <html>
+              <head>
+                <meta charset="utf-8">
+                <style>
+                  body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                  .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                  .header { background-color: #4F46E5; color: white; padding: 20px; text-align: center; border-radius: 5px 5px 0 0; }
+                  .content { background-color: #f9fafb; padding: 30px; border-radius: 0 0 5px 5px; }
+                  .credentials { background-color: white; padding: 20px; border-radius: 5px; margin: 20px 0; border: 1px solid #e5e7eb; }
+                  .credential-row { margin: 10px 0; }
+                  .label { font-weight: bold; color: #6b7280; }
+                  .value { color: #111827; font-family: monospace; background-color: #f3f4f6; padding: 5px 10px; border-radius: 3px; display: inline-block; }
+                  .button { display: inline-block; background-color: #4F46E5; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+                  .footer { text-align: center; color: #6b7280; margin-top: 30px; font-size: 14px; }
+                </style>
+              </head>
+              <body>
+                <div class="container">
+                  <div class="header">
+                    <h1>${companyName}</h1>
+                  </div>
+                  <div class="content">
+                    <h2>Your Email Has Been Updated</h2>
+                    <p>Hello ${full_name},</p>
+                    <p>Your email address has been updated by an administrator. Here are your login credentials for future reference:</p>
+                    
+                    <div class="credentials">
+                      <div class="credential-row">
+                        <span class="label">New Email:</span><br>
+                        <span class="value">${email}</span>
+                      </div>
+                      <div class="credential-row">
+                        <span class="label">Password:</span><br>
+                        <span class="value">${passwordToSend}</span>
+                      </div>
+                    </div>
+                    
+                    <p>You can use these credentials to access your account:</p>
+                    <center>
+                      <a href="${loginUrl}" class="button">Login to Platform</a>
+                    </center>
+                    
+                    <div class="footer">
+                      <p>If you did not request this change, please contact support immediately.</p>
+                      <p>&copy; ${new Date().getFullYear()} ${companyName}. All rights reserved.</p>
+                    </div>
+                  </div>
+                </div>
+              </body>
+            </html>
+          `,
+        });
+
+        console.log(`✅ Credentials email successfully sent to ${email}${ccEmail ? ' with CC to ' + ccEmail : ''}`);
+        emailSent = true;
+      } catch (error) {
+        console.error('❌ Error sending credentials email:', error);
+        console.error('Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+        
+        // Detailed error categorization
+        let errorMessage = 'Failed to send email';
+        if (error instanceof Error) {
+          if (error.message.includes('Connection')) {
+            errorMessage = `SMTP Connection Error: ${error.message}`;
+          } else if (error.message.includes('Authentication') || error.message.includes('auth')) {
+            errorMessage = `SMTP Authentication Error: ${error.message}`;
+          } else if (error.message.includes('Invalid email')) {
+            errorMessage = `Email Validation Error: ${error.message}`;
+          } else {
+            errorMessage = `SMTP Error: ${error.message}`;
+          }
+        }
+        
+        emailError = errorMessage;
+        console.error('Categorized error:', emailError);
+      }
+    } else if (emailChanged && !resend_credentials) {
+      console.log('Email changed but resend_credentials is false, skipping email send');
+    } else if (!emailChanged) {
+      console.log('Email not changed, skipping email send');
+    }
+
+    return new Response(
+      JSON.stringify({ 
+        success: true,
+        message: 'Student details updated successfully',
+        email_sent: emailSent,
+        email_error: emailError,
+        password_regenerated: passwordRegenerated,
+        enrollment_updated: !!enrollment_id
+      }),
+      { 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        status: 200 
+      }
+    );
+
+  } catch (error: any) {
+    console.error('Error updating student details:', error);
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        status: 400 
+      }
+    );
+  }
+});
